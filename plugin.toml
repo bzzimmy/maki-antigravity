@@ -1,0 +1,5 @@
+min_maki_version = "0.4.12"
+
+# Declare only the guarded capabilities the plugin uses. A tool whose
+# `permission` is not granted here is refused at load.
+[permissions]
