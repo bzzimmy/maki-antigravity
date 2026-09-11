@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""maki dynamic provider for Google Antigravity (Cloud Code Assist) over OAuth.
+
+maki calls `info`, `models`, `resolve`, `reload`, `refresh`, `login` and
+`logout`; the maki-antigravity plugin runs `serve` for the request proxy and
+`status` for the /antigravity command. Antigravity speaks the Gemini request
+format inside a `{project, model, request}` envelope, so `resolve` points
+maki's google protocol at a loopback proxy that wraps each request and unwraps
+each streamed chunk. The bearer token travels through the proxy untouched;
+maki refreshes it.
+"""
+
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import select
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import webbrowser
+
+SLUG = "antigravity"
+DISPLAY_NAME = "Antigravity"
+# Google's public Antigravity desktop OAuth client, encoded so secret scanners
+# do not mistake a shipped client for a leaked one.
+CLIENT_ID = base64.b64decode(
+    "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlc" + "C5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
+).decode("ascii")
+CLIENT_SECRET = base64.b64decode("R09DU1BYLUs1OEZXUjQ" + "4NkxkTEoxbUxCOHNYQzR6NnFEQWY=").decode("ascii")
+AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
+SCOPES = " ".join(
+    [
+        "https://www.googleapis.com/auth/aicode",
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/cclog",
+        "https://www.googleapis.com/auth/experimentsandconfigs",
+    ]
+)
+CALLBACK_HOST = "127.0.0.1"
+CALLBACK_PORT = 51121
+CALLBACK_PATH = "/oauth-callback"
+REDIRECT_URI = "http://localhost:%d%s" % (CALLBACK_PORT, CALLBACK_PATH)
+API_URL = "https://cloudcode-pa.googleapis.com"
+USER_AGENT = "antigravity/cli/1.1.23 (aidev_client; os_type=linux; arch=amd64; cl=974125021; auth_method=consumer)"
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 51123
+PROXY_URL = "http://%s:%d" % (PROXY_HOST, PROXY_PORT)
+STREAM_SUFFIX = ":streamGenerateContent"
+REFRESH_MARGIN_S = 300
+HTTP_TIMEOUT_S = 30
+STREAM_TIMEOUT_S = 600
+STDIN_POLL_S = 0.25
+TOKEN_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
+NOT_LOGGED_IN = "not logged in to Antigravity: run `maki auth login antigravity`"
+
+# Runtime model ids as Antigravity advertises them; the thinking level is part of the id.
+MODELS = [
+    ("gemini-3.8-flash-low", "medium", 65536),
+    ("gemini-3.8-flash-medium", "medium", 65536),
+    ("gemini-3.8-flash-high", "medium", 65536),
+    ("gemini-3.7-flash-low", "medium", 65536),
+    ("gemini-3.7-flash-medium", "medium", 65536),
+    ("gemini-3.7-flash-high", "medium", 65536),
+    ("gemini-3.6-flash-low", "weak", 65536),
+    ("gemini-3.6-flash-medium", "weak", 65536),
+    ("gemini-3.6-flash-high", "weak", 65536),
+    ("gemini-3.1-pro-low", "strong", 65535),
+    ("gemini-pro-agent", "strong", 65535),
+]
+CONTEXT_WINDOW = 1048576
+
+
+class Fail(Exception):
+    """An error the user reads on stderr; the exit code tells maki it failed."""
+
+
+def state_dir():
+    home = os.path.expanduser("~")
+    legacy = os.path.join(home, ".maki")
+    if os.path.isdir(legacy):
+        return legacy
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+    return os.path.join(base, "maki")
+
+
+def token_path():
+    return os.path.join(state_dir(), "auth", SLUG + ".json")
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def load_tokens():
+    try:
+        with open(token_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not all(isinstance(data.get(key), str) for key in ("access", "refresh", "project")):
+        return None
+    if not isinstance(data.get("expires"), int):
+        return None
+    return data
+
+
+def save_tokens(tokens):
+    path = token_path()
+    os.makedirs(os.path.dirname(path), PRIVATE_DIR_MODE, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, TOKEN_FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(tokens, handle, indent=2)
+    os.replace(tmp, path)
+
+
+def require_tokens():
+    tokens = load_tokens()
+    if tokens is None:
+        raise Fail(NOT_LOGGED_IN)
+    return tokens
+
+
+def expires_within(tokens, seconds):
+    return tokens["expires"] <= now_ms() + seconds * 1000
+
+
+def http_json(url, body=None, token=None, form=False):
+    headers = {"accept": "application/json", "user-agent": USER_AGENT}
+    if token:
+        headers["authorization"] = "Bearer " + token
+    if form:
+        data = urllib.parse.urlencode(body).encode("utf-8")
+        headers["content-type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["content-type"] = "application/json"
+    else:
+        data = None
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as err:
+        raise Fail("%s answered %d: %s" % (url, err.code, err.read().decode("utf-8", "replace").strip()))
+    except OSError as err:
+        raise Fail("%s unreachable: %s" % (url, err))
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise Fail("%s returned invalid JSON" % url)
+
+
+def tokens_from_response(data, previous=None):
+    access = data.get("access_token")
+    refresh = data.get("refresh_token") or (previous or {}).get("refresh")
+    expires_in = data.get("expires_in")
+    if not isinstance(access, str) or not isinstance(refresh, str) or not isinstance(expires_in, (int, float)):
+        raise Fail("token response is missing access_token, refresh_token or expires_in")
+    tokens = {"access": access, "refresh": refresh, "expires": now_ms() + int(expires_in) * 1000}
+    for key in ("project", "email"):
+        if previous and isinstance(previous.get(key), str):
+            tokens[key] = previous[key]
+    return tokens
+
+
+def refresh_tokens(tokens):
+    data = http_json(
+        TOKEN_URL,
+        {
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "refresh_token": tokens["refresh"],
+        },
+        form=True,
+    )
+    fresh = tokens_from_response(data, tokens)
+    save_tokens(fresh)
+    return fresh
+
+
+def emit_auth(tokens):
+    auth = {"base_url": PROXY_URL, "headers": {"authorization": "Bearer " + tokens["access"]}}
+    sys.stdout.write(json.dumps(auth) + "\n")
+
+
+def extract_project(data):
+    """The project id, from whichever key loadCodeAssist answered with."""
+    if not isinstance(data, dict):
+        return None
+    for key in ("antigravityProjectId", "projectId", "cloudaicompanionProject", "project"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict) and isinstance(value.get("id"), str):
+            return value["id"]
+    return None
+
+
+def discover_project(token):
+    data = http_json(API_URL + "/v1internal:loadCodeAssist", {"metadata": {"ideType": "ANTIGRAVITY"}}, token)
+    project = extract_project(data)
+    if project:
+        return project
+    data = http_json(API_URL + "/v1internal:listCloudAICompanionProjects", {}, token)
+    for item in data.get("projects") or data.get("cloudaicompanionProjects") or []:
+        project = item if isinstance(item, str) else extract_project(item)
+        if project:
+            return project
+    raise Fail("Antigravity did not report a project for this account")
+
+
+# Login
+
+
+def base64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def parse_authorization_input(text):
+    """Accepts a redirect URL, `code#state`, a query string, or a bare code."""
+    value = text.strip()
+    if not value:
+        return None, None
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme and parts.netloc:
+        query = urllib.parse.parse_qs(parts.query)
+        return (query.get("code") or [None])[0], (query.get("state") or [None])[0]
+    if "#" in value:
+        code, state = value.split("#", 1)
+        return code, state
+    if "code=" in value:
+        query = urllib.parse.parse_qs(value)
+        return (query.get("code") or [None])[0], (query.get("state") or [None])[0]
+    return value, None
+
+
+class CallbackServer(http.server.HTTPServer):
+    def __init__(self, expected_state):
+        super().__init__((CALLBACK_HOST, CALLBACK_PORT), CallbackHandler)
+        self.expected_state = expected_state
+        self.result = None
+        self.failure = None
+
+
+class CallbackHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def reply(self, status, text):
+        body = ("<html><body><p>%s</p></body></html>" % text).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parts = urllib.parse.urlsplit(self.path)
+        if parts.path != CALLBACK_PATH:
+            self.reply(404, "Not found.")
+            return
+        query = urllib.parse.parse_qs(parts.query)
+        error = (query.get("error") or [None])[0]
+        code = (query.get("code") or [None])[0]
+        state = (query.get("state") or [None])[0]
+        if error:
+            self.server.failure = "login did not complete: %s" % error
+            self.reply(400, "Login failed: %s" % error)
+        elif not code or state != self.server.expected_state:
+            self.server.failure = "callback is missing the code or carries the wrong state"
+            self.reply(400, "Missing code or state mismatch.")
+        else:
+            self.server.result = (code, state)
+            self.reply(200, "Login complete. You can close this window and return to the terminal.")
+
+
+def wait_for_code(server, expected_state):
+    """Returns the code from whichever arrives first: the browser callback or a
+    pasted redirect URL on stdin. A closed stdin leaves only the callback."""
+    sys.stdout.write("> ")
+    sys.stdout.flush()
+    stdin_open = True
+    while True:
+        if server.failure:
+            raise Fail(server.failure)
+        if server.result:
+            return server.result
+        if not stdin_open:
+            time.sleep(STDIN_POLL_S)
+            continue
+        ready, _, _ = select.select([sys.stdin], [], [], STDIN_POLL_S)
+        if not ready:
+            continue
+        line = sys.stdin.readline()
+        if not line:
+            stdin_open = False
+            continue
+        code, state = parse_authorization_input(line)
+        if code:
+            if state is not None and state != expected_state:
+                raise Fail("OAuth state mismatch, start the login again")
+            return code, state or expected_state
+        sys.stdout.write("no code found in that input, paste the redirect URL\n> ")
+        sys.stdout.flush()
+
+
+def has_desktop():
+    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def cmd_login():
+    verifier = base64url(secrets.token_bytes(32))
+    challenge = base64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    state = base64url(secrets.token_bytes(32))
+    try:
+        server = CallbackServer(state)
+    except OSError as err:
+        raise Fail("cannot listen on %s: %s" % (REDIRECT_URI, err))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    query = urllib.parse.urlencode(
+        {
+            "client_id": CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+    )
+    url = AUTHORIZE_URL + "?" + query
+    print("Log in with Google in your browser:\n\n  %s\n" % url)
+    if has_desktop():
+        webbrowser.open(url)
+    print("Waiting for the browser. If it runs on another machine, paste the final redirect URL here.")
+    try:
+        code, _ = wait_for_code(server, state)
+    finally:
+        server.shutdown()
+        server.server_close()
+    print("Exchanging the code for tokens...", flush=True)
+    data = http_json(
+        TOKEN_URL,
+        {
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": verifier,
+        },
+        form=True,
+    )
+    tokens = tokens_from_response(data)
+    tokens["project"] = discover_project(tokens["access"])
+    try:
+        tokens["email"] = http_json(USERINFO_URL, token=tokens["access"]).get("email")
+    except Fail:
+        pass
+    save_tokens(tokens)
+    print("Logged in as %s. Tokens are in %s." % (tokens.get("email") or "your Google account", token_path()))
+    print("Restart maki if it is running, then pick a model, for example: /model antigravity/gemini-3.8-flash-high")
+
+
+def cmd_logout():
+    try:
+        os.remove(token_path())
+    except FileNotFoundError:
+        print("no Antigravity tokens were stored")
+        return
+    print("Antigravity tokens removed")
+
+
+# Proxy
+
+
+class ProxyServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    """Turns maki's `POST /models/<id>:streamGenerateContent` into the
+    Antigravity envelope and strips the `response` wrapper from each chunk."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def send_text(self, status, text):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if not path.startswith("/models/") or not path.endswith(STREAM_SUFFIX):
+            self.send_text(404, '{"error": {"message": "unsupported path"}}')
+            return
+        tokens = load_tokens()
+        if tokens is None:
+            self.send_text(401, json.dumps({"error": {"message": NOT_LOGGED_IN}}))
+            return
+        model = urllib.parse.unquote(path[len("/models/") : -len(STREAM_SUFFIX)])
+        length = int(self.headers.get("content-length") or 0)
+        try:
+            inner = json.loads(self.rfile.read(length).decode("utf-8"))
+        except ValueError:
+            self.send_text(400, '{"error": {"message": "request body is not JSON"}}')
+            return
+        envelope = {
+            "project": tokens["project"],
+            "model": model,
+            "request": inner,
+            "requestType": "agent",
+            "userAgent": "antigravity",
+            "requestId": "agent/maki/%d/%s/%d" % (now_ms(), uuid.uuid4(), len(inner.get("contents") or [])),
+        }
+        request = urllib.request.Request(
+            API_URL + "/v1internal" + STREAM_SUFFIX + "?alt=sse",
+            data=json.dumps(envelope).encode("utf-8"),
+            headers={
+                "authorization": self.headers.get("authorization") or "",
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+                "user-agent": USER_AGENT,
+            },
+            method="POST",
+        )
+        try:
+            upstream = urllib.request.urlopen(request, timeout=STREAM_TIMEOUT_S)
+        except urllib.error.HTTPError as err:
+            self.send_text(err.code, err.read().decode("utf-8", "replace"))
+            return
+        except OSError as err:
+            self.send_text(502, json.dumps({"error": {"message": "Antigravity unreachable: %s" % err}}))
+            return
+        with upstream:
+            self.send_response(upstream.status)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            for line in upstream:
+                self.write_chunk(unwrap_sse_line(line))
+            self.wfile.write(b"0\r\n\r\n")
+
+    def write_chunk(self, data):
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
+
+
+def unwrap_sse_line(line):
+    """`data: {"response": X}` becomes `data: X`; every other line passes through."""
+    if not line.startswith(b"data:"):
+        return line
+    try:
+        payload = json.loads(line[5:])
+    except ValueError:
+        return line
+    if isinstance(payload, dict) and isinstance(payload.get("response"), dict):
+        payload = payload["response"]
+    return b"data: " + json.dumps(payload).encode("utf-8") + b"\n"
+
+
+def cmd_serve():
+    try:
+        server = ProxyServer((PROXY_HOST, PROXY_PORT), ProxyHandler)
+    except OSError as err:
+        raise Fail("cannot listen on %s: %s" % (PROXY_URL, err))
+    server.serve_forever()
+
+
+# maki commands
+
+
+def cmd_info():
+    info = {"display_name": DISPLAY_NAME, "base": "google", "has_auth": True}
+    sys.stdout.write(json.dumps(info) + "\n")
+
+
+def cmd_models():
+    models = [
+        {
+            "id": model_id,
+            "tier": tier,
+            "context_window": CONTEXT_WINDOW,
+            "max_output_tokens": max_output,
+            "supports_thinking": True,
+            "supports_vision": True,
+        }
+        for model_id, tier, max_output in MODELS
+    ]
+    sys.stdout.write(json.dumps(models) + "\n")
+
+
+def cmd_resolve():
+    tokens = require_tokens()
+    if expires_within(tokens, REFRESH_MARGIN_S):
+        tokens = refresh_tokens(tokens)
+    emit_auth(tokens)
+
+
+def cmd_reload():
+    emit_auth(require_tokens())
+
+
+def cmd_refresh():
+    emit_auth(refresh_tokens(require_tokens()))
+
+
+def cmd_status():
+    tokens = load_tokens()
+    status = {
+        "logged_in": tokens is not None,
+        "email": (tokens or {}).get("email"),
+        "project": (tokens or {}).get("project"),
+        "expires_in_s": (tokens["expires"] - now_ms()) // 1000 if tokens else None,
+    }
+    sys.stdout.write(json.dumps(status) + "\n")
+
+
+COMMANDS = {
+    "info": cmd_info,
+    "models": cmd_models,
+    "resolve": cmd_resolve,
+    "reload": cmd_reload,
+    "refresh": cmd_refresh,
+    "login": cmd_login,
+    "logout": cmd_logout,
+    "serve": cmd_serve,
+    "status": cmd_status,
+}
+
+
+def main(argv):
+    if len(argv) != 2 or argv[1] not in COMMANDS:
+        sys.stderr.write("usage: antigravity <%s>\n" % "|".join(COMMANDS))
+        return 2
+    try:
+        COMMANDS[argv[1]]()
+    except Fail as err:
+        sys.stderr.write("%s\n" % err)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

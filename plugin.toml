@@ -1,5 +1,9 @@
-min_maki_version = "0.4.12"
+min_maki_version = "0.5.3"
 
-# Declare only the guarded capabilities the plugin uses. A tool whose
-# `permission` is not granted here is refused at load.
+# fs_read and fs_write install the provider script into the config directory,
+# run marks it executable, keeps the request proxy alive, and calls it for
+# /antigravity.
 [permissions]
+fs_read = true
+fs_write = true
+run = true
