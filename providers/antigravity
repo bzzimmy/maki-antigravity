@@ -51,7 +51,14 @@ CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 51121
 CALLBACK_PATH = "/oauth-callback"
 REDIRECT_URI = "http://localhost:%d%s" % (CALLBACK_PORT, CALLBACK_PATH)
-API_URL = "https://cloudcode-pa.googleapis.com"
+# Same order as the Antigravity CLI: the production host answers 429 to
+# accounts that daily serves, so a quota answer falls through to the next.
+API_URLS = [
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+]
+FALLTHROUGH_STATUSES = (404, 429)
 USER_AGENT = "antigravity/cli/1.1.23 (aidev_client; os_type=linux; arch=amd64; cl=974125021; auth_method=consumer)"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 51123
@@ -76,6 +83,9 @@ MODELS = [
     ("gemini-3.6-flash-low", "weak", 65536),
     ("gemini-3.6-flash-medium", "weak", 65536),
     ("gemini-3.6-flash-high", "weak", 65536),
+    ("gemini-3.5-flash-extra-low", "weak", 65536),
+    ("gemini-3.5-flash-low", "weak", 65536),
+    ("gemini-3-flash-agent", "weak", 65536),
     ("gemini-3.1-pro-low", "strong", 65535),
     ("gemini-pro-agent", "strong", 65535),
 ]
@@ -213,11 +223,11 @@ def extract_project(data):
 
 
 def discover_project(token):
-    data = http_json(API_URL + "/v1internal:loadCodeAssist", {"metadata": {"ideType": "ANTIGRAVITY"}}, token)
+    data = http_json(API_URLS[0] + "/v1internal:loadCodeAssist", {"metadata": {"ideType": "ANTIGRAVITY"}}, token)
     project = extract_project(data)
     if project:
         return project
-    data = http_json(API_URL + "/v1internal:listCloudAICompanionProjects", {}, token)
+    data = http_json(API_URLS[0] + "/v1internal:listCloudAICompanionProjects", {}, token)
     for item in data.get("projects") or data.get("cloudaicompanionProjects") or []:
         project = item if isinstance(item, str) else extract_project(item)
         if project:
@@ -437,25 +447,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "userAgent": "antigravity",
             "requestId": "agent/maki/%d/%s/%d" % (now_ms(), uuid.uuid4(), len(inner.get("contents") or [])),
         }
-        request = urllib.request.Request(
-            API_URL + "/v1internal" + STREAM_SUFFIX + "?alt=sse",
-            data=json.dumps(envelope).encode("utf-8"),
-            headers={
-                "authorization": self.headers.get("authorization") or "",
-                "content-type": "application/json",
-                "accept": "text/event-stream",
-                "user-agent": USER_AGENT,
-            },
-            method="POST",
-        )
-        try:
-            upstream = urllib.request.urlopen(request, timeout=STREAM_TIMEOUT_S)
-        except urllib.error.HTTPError as err:
-            self.send_text(err.code, err.read().decode("utf-8", "replace"))
-            return
-        except OSError as err:
-            self.send_text(502, json.dumps({"error": {"message": "Antigravity unreachable: %s" % err}}))
-            return
+        headers = {
+            "authorization": self.headers.get("authorization") or "",
+            "content-type": "application/json",
+            "accept": "text/event-stream",
+            "user-agent": USER_AGENT,
+        }
+        body = json.dumps(envelope).encode("utf-8")
+        for index, api_url in enumerate(API_URLS):
+            request = urllib.request.Request(api_url + "/v1internal" + STREAM_SUFFIX + "?alt=sse", body, headers, method="POST")
+            try:
+                upstream = urllib.request.urlopen(request, timeout=STREAM_TIMEOUT_S)
+                break
+            except urllib.error.HTTPError as err:
+                if err.code in FALLTHROUGH_STATUSES and index + 1 < len(API_URLS):
+                    continue
+                self.send_text(err.code, err.read().decode("utf-8", "replace"))
+                return
+            except OSError as err:
+                self.send_text(502, json.dumps({"error": {"message": "Antigravity unreachable: %s" % err}}))
+                return
         with upstream:
             self.send_response(upstream.status)
             self.send_header("content-type", "text/event-stream")

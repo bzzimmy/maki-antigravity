@@ -53,6 +53,8 @@ The plugin starts `providers/antigravity serve` as a plugin job, listening on
 `127.0.0.1:51123`. The provider script tells maki to use that address as the
 Gemini base URL and sends the bearer token as a header. The proxy forwards
 the token, adds the project id, and posts the envelope to
+`daily-cloudcode-pa.googleapis.com`. When that host answers 404 or 429 the
+proxy retries the same request on the sandbox host and then on
 `cloudcode-pa.googleapis.com`. The job ends with maki. A second maki on the
 same machine cannot bind the port, so its job exits and the first proxy serves
 both; if the first maki quits, restart the second.

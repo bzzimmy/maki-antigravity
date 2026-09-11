@@ -123,13 +123,19 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
     """Stands in for Antigravity: records the envelope, answers wrapped SSE."""
 
     received = []
+    status = 200
 
     def log_message(self, fmt, *args):
         pass
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
-        FakeUpstream.received.append((self.path, dict(self.headers), body))
+        FakeUpstream.received.append((self.server.server_address[1], self.path, dict(self.headers), body))
+        if self.server.status != 200:
+            self.send_response(self.server.status)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
         chunks = [
             b'data: {"response": {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]}}\n',
             b"\n",
@@ -143,7 +149,37 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
             self.wfile.write(chunk)
 
 
+def fake_upstream(status=200):
+    server = http.server.HTTPServer(("127.0.0.1", 0), FakeUpstream)
+    server.status = status
+    return server
+
+
 class ProxyTest(unittest.TestCase):
+    def run_proxy(self, upstreams, path="/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse"):
+        proxy = provider.ProxyServer(("127.0.0.1", 0), provider.ProxyHandler)
+        servers = list(upstreams) + [proxy]
+        for server in servers:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        home, patch = isolated_home()
+        api_urls = ["http://127.0.0.1:%d" % s.server_address[1] for s in upstreams]
+        inner = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
+        try:
+            with home, patch, mock.patch.object(provider, "API_URLS", api_urls):
+                provider.save_tokens(TOKENS)
+                request = urllib.request.Request(
+                    "http://127.0.0.1:%d%s" % (proxy.server_address[1], path),
+                    data=json.dumps(inner).encode("utf-8"),
+                    headers={"authorization": "Bearer tok", "content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return inner, response.read().split(b"\n")
+        finally:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
+
     def test_unwrap_sse_line(self):
         self.assertEqual(provider.unwrap_sse_line(b'data: {"response": {"a": 1}}\n'), b'data: {"a": 1}\n')
         self.assertEqual(provider.unwrap_sse_line(b'data: {"a": 1}\n'), b'data: {"a": 1}\n')
@@ -151,27 +187,8 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(provider.unwrap_sse_line(b"data: not json\n"), b"data: not json\n")
 
     def test_proxy_wraps_the_request_and_unwraps_the_stream(self):
-        upstream = http.server.HTTPServer(("127.0.0.1", 0), FakeUpstream)
-        proxy = provider.ProxyServer(("127.0.0.1", 0), provider.ProxyHandler)
-        for server in (upstream, proxy):
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-        home, patch = isolated_home()
-        api_url = "http://127.0.0.1:%d" % upstream.server_address[1]
-        with home, patch, mock.patch.object(provider, "API_URL", api_url):
-            provider.save_tokens(TOKENS)
-            inner = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
-            request = urllib.request.Request(
-                "http://127.0.0.1:%d/models/gemini-3.8-flash-high:streamGenerateContent?alt=sse" % proxy.server_address[1],
-                data=json.dumps(inner).encode("utf-8"),
-                headers={"authorization": "Bearer tok", "content-type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=5) as response:
-                lines = response.read().split(b"\n")
-        for server in (upstream, proxy):
-            server.shutdown()
-            server.server_close()
-        path, headers, envelope = FakeUpstream.received[-1]
+        inner, lines = self.run_proxy([fake_upstream()])
+        _, path, headers, envelope = FakeUpstream.received[-1]
         self.assertEqual(path, "/v1internal:streamGenerateContent?alt=sse")
         self.assertEqual(headers["Authorization"], "Bearer tok")
         self.assertEqual(envelope["project"], "proj-1")
@@ -182,6 +199,14 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(json.loads(lines[0][5:]), {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})
         self.assertEqual(lines[1], b"")
         self.assertEqual(json.loads(lines[2][5:]), {"usageMetadata": {"promptTokenCount": 1}})
+
+    def test_proxy_falls_through_to_the_next_host_on_429(self):
+        exhausted, serving = fake_upstream(429), fake_upstream()
+        FakeUpstream.received.clear()
+        _, lines = self.run_proxy([exhausted, serving])
+        ports = [entry[0] for entry in FakeUpstream.received]
+        self.assertEqual(ports, [exhausted.server_address[1], serving.server_address[1]])
+        self.assertEqual(json.loads(lines[0][5:]), {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})
 
     def test_proxy_rejects_when_not_logged_in(self):
         proxy = provider.ProxyServer(("127.0.0.1", 0), provider.ProxyHandler)
