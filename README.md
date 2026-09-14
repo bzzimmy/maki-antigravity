@@ -7,6 +7,11 @@ a Cloud Code Assist envelope, so the provider runs a loopback proxy that wraps
 each request and unwraps each streamed chunk; maki's own Gemini support handles
 everything else, including token refresh.
 
+Not sure how many people even use Antigravity because Gemini models currently
+suck pretty bad, but if you want, from [G2A](https://www.g2a.com/) you can get a
+Google AI Pro subscription for less than $2 for 6+ months and use Gemini models
+with decent usage basically for free.
+
 ## Requirements
 
 - maki 0.5.3 or newer
