@@ -83,11 +83,7 @@ MODELS = [
     ("gemini-3.6-flash-low", "weak", 65536),
     ("gemini-3.6-flash-medium", "weak", 65536),
     ("gemini-3.6-flash-high", "weak", 65536),
-    ("gemini-3.5-flash-extra-low", "weak", 65536),
-    ("gemini-3.5-flash-low", "weak", 65536),
-    ("gemini-3-flash-agent", "weak", 65536),
     ("gemini-3.1-pro-low", "strong", 65535),
-    ("gemini-pro-agent", "strong", 65535),
 ]
 CONTEXT_WINDOW = 1048576
 
