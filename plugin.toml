@@ -1,9 +1,10 @@
-min_maki_version = "0.5.3"
+min_maki_version = "0.7.0"
+providers = ["antigravity"]
 
-# fs_read and fs_write install the provider script into the config directory,
-# run marks it executable, keeps the request proxy alive, and calls it for
-# /antigravity.
+# net reaches the proxy, the Google token endpoint, and Cloud Code Assist for
+# the project and the model list. run reads the agy sign-in from the keyring
+# and starts the proxy.
 [permissions]
-fs_read = true
-fs_write = true
+net = true
 run = true
+net_hosts = ["127.0.0.1", "oauth2.googleapis.com", "daily-cloudcode-pa.googleapis.com"]

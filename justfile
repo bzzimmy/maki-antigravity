@@ -3,7 +3,7 @@ default:
 
 check:
     cargo check --tests
-    python3 -m py_compile providers/antigravity
+    python3 -m py_compile proxy/antigravity_proxy.py
 
 lint:
     cargo clippy --tests -- -D warnings

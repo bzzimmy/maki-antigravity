@@ -1,11 +1,10 @@
 <h1><img src="assets/antigravity-logo.svg" alt="Antigravity" width="40" align="absmiddle"> maki-antigravity</h1>
 
 Use Google Antigravity in [maki](https://github.com/tontinton/maki). The
-package adds an `antigravity` provider that logs in with the same Google OAuth
-flow as the Antigravity CLI. Antigravity speaks the Gemini request format inside
-a Cloud Code Assist envelope, so the provider runs a loopback proxy that wraps
-each request and unwraps each streamed chunk; maki's own Gemini support handles
-everything else, including token refresh.
+package adds an `antigravity` provider that signs in with your Antigravity CLI
+(`agy`) account. Antigravity speaks the Gemini request format inside a Cloud
+Code Assist envelope, so a small loopback proxy wraps each request and unwraps
+each streamed chunk. maki's own Gemini support handles everything else.
 
 Not sure how many people even use Antigravity because Gemini models currently
 suck pretty bad, but if you want, from [G2A](https://www.g2a.com/) you can get a
@@ -14,10 +13,10 @@ with decent usage basically for free.
 
 ## Requirements
 
-- maki 0.5.3 or newer
+- maki 0.7.0 or newer
+- [agy](https://antigravity.google/docs/cli/install), signed in once
 - Python 3.8 or newer on `PATH` as `python3`
-- A Google account with access to Antigravity
-- Linux or macOS
+- macOS, or Linux with `secret-tool` (libsecret)
 
 ## Install
 
@@ -29,47 +28,53 @@ maki.pack.add({
 })
 ```
 
-Start maki once so the plugin installs the provider script to
-`~/.config/maki/providers/antigravity`, then restart after login so maki
-discovers it.
+maki asks once to approve the permissions and the `antigravity` provider name.
 
 ## Setup
+
+Run `agy` and sign in, if you have not yet. Then check that maki can use it:
 
 ```
 maki auth login antigravity
 ```
 
-Login opens the browser. If the browser is on another machine, paste the
-final redirect URL into the terminal. Tokens and the Antigravity project id
-are stored in the maki state directory with mode 0600 and refresh on their
-own.
+The plugin reads the agy sign-in from the system keyring (the macOS Keychain
+or Secret Service) and never changes it. macOS may ask once whether `security`
+can read the `gemini` item. maki keeps its own short-lived access token in its
+state directory and renews it from the agy sign-in when it expires.
 
-Pick a model with `/model`; the catalog is under the `antigravity/` prefix and
-uses the runtime ids Antigravity advertises, with the thinking level in the
-name, for example `antigravity/gemini-3.8-flash-high`. Gemini models only.
+Pick a model with `/model`. The catalog comes from your account at runtime, for
+example `antigravity/gemini-3.8-flash` or `antigravity/claude-opus-5-5`.
+Antigravity serves one model id per reasoning level, so each model is listed
+once and maki's thinking level picks the variant:
 
-- `/antigravity` shows the login state, token expiry, and whether the proxy
-  is running.
-- `maki auth logout antigravity` removes the stored tokens.
+| maki thinking | Antigravity variant |
+| --- | --- |
+| off, minimal, low | `-low` |
+| adaptive, medium | `-medium` |
+| high, xhigh, max | `-high` |
+
+A model that Antigravity offers at a single level, such as
+`gpt-oss-120b-medium`, keeps its full id and ignores the setting.
+
+`maki auth logout antigravity` removes maki's token. The agy sign-in stays.
 
 ## How requests flow
 
-The plugin starts `providers/antigravity serve` as a plugin job, listening on
-`127.0.0.1:51123`. The provider script tells maki to use that address as the
-Gemini base URL and sends the bearer token as a header. The proxy forwards
-the token, adds the project id, and posts the envelope to
-`daily-cloudcode-pa.googleapis.com`. When that host answers 404 or 429 the
-proxy retries the same request on the sandbox host and then on
-`cloudcode-pa.googleapis.com`. The job ends with maki. A second maki on the
-same machine cannot bind the port, so its job exits and the first proxy serves
-both; if the first maki quits, restart the second.
+The plugin starts `proxy/antigravity_proxy.py` as a plugin job, listening on
+`127.0.0.1:51123`, and points maki's Gemini requests at it with the bearer
+token and the project id as headers. The proxy picks the reasoning level
+variant, adds the ids that Claude and GPT require on tool calls, wraps the
+request in the envelope, and posts it to `daily-cloudcode-pa.googleapis.com`.
+The job ends with maki. A second maki on the same machine cannot bind the port,
+so its proxy exits and the first one serves both. If the first maki quits,
+restart the second.
 
 ## Permissions
 
-The package requests exactly what it calls: `fs_read` and `fs_write` to
-install the script, `run` to mark it executable, keep the proxy alive, and
-call it for `/antigravity`. The proxy is the only thing that talks to Google
-for model requests; login and refresh go from the script to Google directly.
+The package requests exactly what it uses: `net` for the proxy, the Google
+token endpoint, and Cloud Code Assist, and `run` to read the agy sign-in from
+the keyring and to start the proxy.
 
 ## Development
 

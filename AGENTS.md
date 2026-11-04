@@ -1,58 +1,64 @@
-maki-antigravity puts Google Antigravity behind maki's dynamic provider
-mechanism. It loads through the maki pack system, not as a builtin. Two parts:
+maki-antigravity puts Google Antigravity behind a maki plugin provider. It
+loads through the maki pack system, not as a builtin. Two parts:
 
-- `providers/antigravity`: a Python 3 script, the maki dynamic provider.
-  Google OAuth login, token storage, refresh, the model list, and the request
-  proxy. Standard library only, one file, no `.py` extension because maki runs
-  it by name. `info` declares `google` as the base protocol, `models` lists
-  the Gemini runtime ids, and `resolve` points maki at the loopback proxy
-  with the bearer header. The proxy (`serve`) wraps maki's Gemini request in
-  the Cloud Code Assist envelope, adds the project id, forwards the bearer,
-  and strips the `response` wrapper from each SSE chunk. Nothing else about
-  the request changes.
-- `plugin/maki_antigravity.lua`: installs the script into the config
-  `providers/` directory, starts the proxy as a plugin-scoped job, and
-  registers `/antigravity` for a status line. Keep it to that: anything else
-  the script can do is reachable through `maki auth`.
+- `plugin/maki_antigravity.lua`: one `maki.provider.register` call with the
+  `google` codec and a loopback `base_url`, plus the job that starts the
+  proxy. The `auth` hook mints access tokens from the agy refresh token in the
+  system keyring and caches them, with the project id, through
+  `maki.provider.auth`. `list_models` reads `fetchAvailableModels` and folds
+  the `-low`, `-medium` and `-high` ids of a model into one entry. `login`
+  only checks the agy sign-in. There is no OAuth flow of its own and nothing
+  is written to the keyring.
+- `proxy/antigravity_proxy.py`: standard library only. Wraps maki's Gemini
+  request in the Cloud Code Assist envelope, picks the level variant from
+  maki's thinking config, adds the tool call ids Claude and GPT require, and
+  strips the `response` wrapper from each SSE chunk. Nothing else about the
+  request changes. The proxy exists because the `google` codec has no body
+  hook and Lua cannot listen on a port.
+
+The wire details (host, user agent, envelope fields, model discovery) come
+from captures of agy itself. Check a change against agy before guessing.
 
 ## Code guidelines
 
 - No trivial comments, minimal bloat, no unnecessary state.
 - Constants at the top of each file, in both languages.
-- Lua: fallible runtime operations return the `(value, err)` pair and never
-  throw. Setup at load logs and returns on the first failure instead of
-  failing the package.
-- Python: user-facing failures raise `Fail`; `main` prints them to stderr and
-  exits non-zero, which is how maki surfaces script errors. The proxy answers
-  errors as JSON bodies with the upstream status so maki's Gemini parser
-  reports them.
-- `plugin.toml` grants exactly what the Lua calls. Keep it aligned by hand.
+- Lua hooks fail the way maki expects: an HTTP failure returns
+  `nil, maki.provider.http_error(res)` so maki retries it, anything else
+  raises with `error`, which is the message the user reads.
+- The proxy answers errors as JSON bodies with the upstream status so maki's
+  Gemini parser reports them.
+- `plugin.toml` grants exactly what the Lua calls, `net_hosts` lists every
+  host it reaches, and `providers` lists the slug. Keep it aligned by hand.
 
 ## Testing
 
 Cheapest first:
 
-- `just check` runs `cargo check --tests` and byte-compiles the script.
+- `just check` runs `cargo check --tests` and byte-compiles the proxy.
 - `just lint`
-- `just test-py` runs the Python tests, including the proxy against a fake
-  upstream on an ephemeral port.
+- `just test-py` runs the proxy tests against a fake upstream on an ephemeral
+  port.
 - `just test` runs both suites; the Rust part needs `cargo-nextest`.
 
 The Rust tests load the package through `PluginHost::load_package`, passing the
-repo root. Loading installs the script and starts the proxy job, so the test
-points `HOME` and the XDG variables at a temporary directory before creating
-the host; the job dies with the host. Assert Lua-visible effects: the
-registered command and the installed file.
+repo root, with the grants `plugin.toml` asks for. The provider registry and
+the environment are global, so each test needs a process of its own, which
+nextest gives it. The test points `HOME` and the XDG variables at a temporary
+directory before creating the host. Assert effects maki sees: the registered
+provider and what `auth` resolves from cached credentials. Anything that reads
+the keyring or reaches Google is checked by hand with a real agy sign-in.
 
 Dev-dependencies pin a revision of maki. Move the pin when the host changes
 what the plugin uses.
 
 ## Layout
 
-- `providers/antigravity`: the provider script.
 - `plugin/`: the Lua entry file.
-- `plugin.toml`: `min_maki_version` and the `[permissions]` request.
-- `tests/plugin.rs`: host harness. `tests/test_provider.py`: script tests.
+- `proxy/`: the request proxy.
+- `plugin.toml`: `min_maki_version`, `providers`, and the `[permissions]`
+  request.
+- `tests/plugin.rs`: host harness. `tests/test_proxy.py`: proxy tests.
 - `justfile`: check, lint, test, test-py, fmt-lua.
 
 ## Docs
