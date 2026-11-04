@@ -26,6 +26,8 @@ local KEYRING_WAIT_MS = 20000
 local LEVELS = { "low", "medium", "high" }
 local REFRESH_MARGIN_S = 300
 local NOT_SIGNED_IN = "agy is not signed in: run `agy`, sign in, and try again"
+local QUOTA_REACHED = "quota reached"
+local NOT_RETRYABLE = 400
 
 local function agy_signin()
   for _, argv in ipairs(KEYRING_READS) do
@@ -174,6 +176,19 @@ local function list_models(ctx)
   return rows
 end
 
+-- A spent quota answers 429 for hours or days, so retrying only stalls the turn.
+local function map_error(_, status, message)
+  if status == 429 and message:find(QUOTA_REACHED, 1, true) then
+    local resets = message:match("Resets in (%w+)")
+    return {
+      status = NOT_RETRYABLE,
+      message = ("Antigravity quota for this model is used up%s. Pick another model with /model."):format(
+        resets and (", it resets in " .. resets) or ""
+      ),
+    }
+  end
+end
+
 local function login(ctx)
   local creds, err = credentials(ctx.slug, true)
   if not creds then
@@ -195,6 +210,7 @@ maki.provider.register({
   base_url = PROXY_URL,
   auth = auth,
   list_models = list_models,
+  map_error = map_error,
   login = login,
 })
 
