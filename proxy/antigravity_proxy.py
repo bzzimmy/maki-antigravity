@@ -9,6 +9,8 @@ streamed chunk.
 
 import http.server
 import json
+import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -25,6 +27,22 @@ STREAM_SUFFIX = ":streamGenerateContent"
 XHIGH_SUFFIX = "-xhigh"
 XHIGH_THINKING_LEVEL = 100
 STREAM_TIMEOUT_S = 600
+SYSTEM_CA_FILES = ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt")
+
+
+def ssl_context():
+    """python.org macOS installers ship with no default CA bundle; fall back to
+    the OS root store when OpenSSL reports neither cafile nor capath."""
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile or paths.capath:
+        return None
+    for path in SYSTEM_CA_FILES:
+        if os.path.exists(path):
+            return ssl.create_default_context(cafile=path)
+    return None
+
+
+SSL_CONTEXT = ssl_context()
 
 
 def apply_xhigh(model, request):
@@ -96,7 +114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         }
         try:
             upstream = urllib.request.urlopen(
-                urllib.request.Request(API_URL, json.dumps(envelope).encode(), headers), timeout=STREAM_TIMEOUT_S
+                urllib.request.Request(API_URL, json.dumps(envelope).encode(), headers),
+                timeout=STREAM_TIMEOUT_S,
+                context=SSL_CONTEXT,
             )
         except urllib.error.HTTPError as err:
             self.send_body(err.code, err.read())

@@ -1,6 +1,7 @@
 import http.server
 import json
 import pathlib
+import ssl
 import sys
 import threading
 import unittest
@@ -103,6 +104,21 @@ class ProxyTest(unittest.TestCase):
         with caught.exception as error:
             self.assertEqual(error.code, 429)
             self.assertEqual(json.loads(error.read()), {"error": {"message": "quota"}})
+
+
+class SslContextTest(unittest.TestCase):
+    def test_falls_back_to_system_ca_bundle_when_default_paths_are_missing(self):
+        empty = ssl.DefaultVerifyPaths(None, None, "SSL_CERT_FILE", "", "SSL_CERT_DIR", "")
+        with mock.patch.object(proxy.ssl, "get_default_verify_paths", return_value=empty):
+            with mock.patch.object(proxy.os.path, "exists", side_effect=lambda p: p == "/etc/ssl/cert.pem"):
+                with mock.patch.object(proxy.ssl, "create_default_context", return_value="ctx") as create:
+                    self.assertEqual(proxy.ssl_context(), "ctx")
+                    create.assert_called_once_with(cafile="/etc/ssl/cert.pem")
+
+    def test_uses_default_context_when_openssl_has_verify_paths(self):
+        configured = ssl.DefaultVerifyPaths("/custom/cert.pem", None, "SSL_CERT_FILE", "", "SSL_CERT_DIR", "")
+        with mock.patch.object(proxy.ssl, "get_default_verify_paths", return_value=configured):
+            self.assertIsNone(proxy.ssl_context())
 
 
 if __name__ == "__main__":
