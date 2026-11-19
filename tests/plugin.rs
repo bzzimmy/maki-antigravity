@@ -82,4 +82,8 @@ fn a_cached_token_becomes_the_bearer_and_project_headers() {
         Some(format!("Bearer {ACCESS}").as_str())
     );
     assert_eq!(header(PROJECT_HEADER), Some(PROJECT));
+    assert!(
+        header("user-agent").is_some_and(|ua| ua.starts_with("antigravity/cli/")),
+        "expected antigravity user-agent header"
+    );
 }

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Loopback proxy between maki's Gemini requests and Antigravity.
 
-maki posts `/models/<id>:streamGenerateContent` with the bearer token and the
-project as headers. The proxy wraps the body in the Cloud Code Assist envelope,
-picks the reasoning level variant of the model, and strips the `response`
-wrapper from each streamed chunk.
+maki posts `/models/<id>:streamGenerateContent` with the bearer token, user
+agent, and project as headers. The proxy adds tool call ids, wraps the body in
+the Cloud Code Assist envelope, and strips the `response` wrapper from each
+streamed chunk.
 """
 
 import http.server
@@ -19,41 +19,22 @@ import uuid
 HOST = "127.0.0.1"
 PORT = 51123
 API_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
-USER_AGENT = "antigravity/cli/1.5.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013440158; auth_method=consumer)"
 PROJECT_HEADER = "x-antigravity-project"
 MODEL_PREFIX = "/models/"
 STREAM_SUFFIX = ":streamGenerateContent"
-LEVELS = ("low", "medium", "high")
-OFF_LEVEL = "low"
-ADAPTIVE_LEVEL = "medium"
-# maki sends models without "gemini" in the id a token budget instead of a
-# level: 20, 40 and 60 percent of its ceiling for low, medium and high, where
-# the ceiling is half the output cap and at most 32768.
-MAX_BUDGET = 32768
-MEDIUM_SHARE = 0.3
-HIGH_SHARE = 0.5
+XHIGH_SUFFIX = "-xhigh"
+XHIGH_THINKING_LEVEL = 100
 STREAM_TIMEOUT_S = 600
 
 
-def thinking_level(generation):
-    config = generation.get("thinkingConfig")
-    if config is None:
-        return OFF_LEVEL
-    if "thinkingLevel" in config:
-        return config["thinkingLevel"].lower()
-    if "thinkingBudget" not in config:
-        return ADAPTIVE_LEVEL
-    ceiling = min(generation.get("maxOutputTokens", 2 * MAX_BUDGET) // 2, MAX_BUDGET)
-    share = config["thinkingBudget"] / ceiling
-    if share < MEDIUM_SHARE:
-        return "low"
-    return "medium" if share < HIGH_SHARE else "high"
-
-
-def upstream_model(model, request):
-    if model.rsplit("-", 1)[-1] in LEVELS:
-        return model
-    return "%s-%s" % (model, thinking_level(request.get("generationConfig", {})))
+def apply_xhigh(model, request):
+    """maki's google codec caps thinkingLevel at high, while Antigravity sends
+    the proto enum value 100 for -xhigh models."""
+    if not model.endswith(XHIGH_SUFFIX):
+        return
+    config = request.get("generationConfig", {}).get("thinkingConfig")
+    if isinstance(config, dict):
+        config["thinkingLevel"] = XHIGH_THINKING_LEVEL
 
 
 def add_call_ids(contents):
@@ -98,10 +79,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         model = urllib.parse.unquote(path[len(MODEL_PREFIX) : -len(STREAM_SUFFIX)])
         request = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)))
+        apply_xhigh(model, request)
         add_call_ids(request.get("contents", []))
         envelope = {
             "project": self.headers.get(PROJECT_HEADER),
-            "model": upstream_model(model, request),
+            "model": model,
             "request": request,
             "requestType": "agent",
             "userAgent": "antigravity",
@@ -110,7 +92,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers = {
             "authorization": self.headers.get("authorization", ""),
             "content-type": "application/json",
-            "user-agent": USER_AGENT,
+            "user-agent": self.headers.get("user-agent", ""),
         }
         try:
             upstream = urllib.request.urlopen(

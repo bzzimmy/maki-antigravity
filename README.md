@@ -43,19 +43,9 @@ or Secret Service) and never changes it. macOS may ask once whether `security`
 can read the `gemini` item. maki keeps its own short-lived access token in its
 state directory and renews it from the agy sign-in when it expires.
 
-Pick a model with `/model`. The catalog comes from your account at runtime, for
-example `antigravity/gemini-3.8-flash` or `antigravity/claude-opus-5-5`.
-Antigravity serves one model id per reasoning level, so each model is listed
-once and maki's thinking level picks the variant:
-
-| maki thinking | Antigravity variant |
-| --- | --- |
-| off, minimal, low | `-low` |
-| adaptive, medium | `-medium` |
-| high, xhigh, max | `-high` |
-
-A model that Antigravity offers at a single level, such as
-`gpt-oss-120b-medium`, keeps its full id and ignores the setting.
+Pick a model with `/model`. The catalog comes from your account at runtime,
+matching `agy models`, for example `antigravity/gemini-4-neon-xhigh`,
+`antigravity/gemini-3.8-flash-high`, or `antigravity/claude-opus-5-5-medium`.
 
 `maki auth logout antigravity` removes maki's token. The agy sign-in stays.
 
@@ -63,12 +53,12 @@ A model that Antigravity offers at a single level, such as
 
 The plugin starts `proxy/antigravity_proxy.py` as a plugin job, listening on
 `127.0.0.1:51123`, and points maki's Gemini requests at it with the bearer
-token and the project id as headers. The proxy picks the reasoning level
-variant, adds the ids that Claude and GPT require on tool calls, wraps the
-request in the envelope, and posts it to `daily-cloudcode-pa.googleapis.com`.
-The job ends with maki. A second maki on the same machine cannot bind the port,
-so its proxy exits and the first one serves both. If the first maki quits,
-restart the second.
+token, user agent, and project id as headers. The proxy sets the `xhigh`
+thinking level value when needed, adds the ids that Claude and GPT require on
+tool calls, wraps the request in the envelope, and posts it to
+`daily-cloudcode-pa.googleapis.com`. The job ends with maki. A second maki on
+the same machine cannot bind the port, so its proxy exits and the first one
+serves both. If the first maki quits, restart the second.
 
 ## Permissions
 

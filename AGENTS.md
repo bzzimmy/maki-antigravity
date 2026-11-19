@@ -5,16 +5,15 @@ loads through the maki pack system, not as a builtin. Two parts:
   `google` codec and a loopback `base_url`, plus the job that starts the
   proxy. The `auth` hook mints access tokens from the agy refresh token in the
   system keyring and caches them, with the project id, through
-  `maki.provider.auth`. `list_models` reads `fetchAvailableModels` and folds
-  the `-low`, `-medium` and `-high` ids of a model into one entry. `login`
-  only checks the agy sign-in. There is no OAuth flow of its own and nothing
-  is written to the keyring.
+  `maki.provider.auth`. `list_models` reads `fetchAvailableModels` and lists
+  the model ids verbatim. `login` only checks the agy sign-in. There is no
+  OAuth flow of its own and nothing is written to the keyring.
 - `proxy/antigravity_proxy.py`: standard library only. Wraps maki's Gemini
-  request in the Cloud Code Assist envelope, picks the level variant from
-  maki's thinking config, adds the tool call ids Claude and GPT require, and
-  strips the `response` wrapper from each SSE chunk. Nothing else about the
-  request changes. The proxy exists because the `google` codec has no body
-  hook and Lua cannot listen on a port.
+  request in the Cloud Code Assist envelope, maps `-xhigh` thinking level to
+  Antigravity's proto enum value, adds the tool call ids Claude and GPT
+  require, and strips the `response` wrapper from each SSE chunk. Nothing else
+  about the request changes. The proxy exists because the `google` codec has
+  no body hook and Lua cannot listen on a port.
 
 The wire details (host, user agent, envelope fields, model discovery) come
 from captures of agy itself. Check a change against agy before guessing.

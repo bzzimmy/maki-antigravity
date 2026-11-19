@@ -9,7 +9,7 @@ local PROXY_SCRIPT = "proxy/antigravity_proxy.py"
 local API_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
 local TOKEN_URL = "https://oauth2.googleapis.com/token"
 local USER_AGENT =
-  "antigravity/cli/1.5.0 (aidev_client; os_type=darwin; arch=arm64; cl=1013440158; auth_method=consumer)"
+  "antigravity/cli/1.5.12 (aidev_client; os_type=darwin; arch=arm64; cl=1024904911; auth_method=consumer)"
 local PROJECT_HEADER = "x-antigravity-project"
 -- agy's public OAuth client, encoded so secret scanners do not flag it.
 local CLIENT_ID = maki.base64.decode(
@@ -23,7 +23,6 @@ local KEYRING_READS = {
 }
 local KEYRING_ENCODED = "^go%-keyring%-base64:(.+)$"
 local KEYRING_WAIT_MS = 20000
-local LEVELS = { "low", "medium", "high" }
 local REFRESH_MARGIN_S = 300
 local NOT_SIGNED_IN = "agy is not signed in: run `agy`, sign in, and try again"
 local QUOTA_REACHED = "quota reached"
@@ -129,48 +128,40 @@ local function auth(ctx, purpose)
   if not creds then
     return nil, err
   end
-  return { headers = { authorization = "Bearer " .. creds.access, [PROJECT_HEADER] = creds.project } }
+  return {
+    headers = {
+      authorization = "Bearer " .. creds.access,
+      [PROJECT_HEADER] = creds.project,
+      ["user-agent"] = USER_AGENT,
+    },
+  }
 end
 
--- Antigravity serves one id per reasoning level. A model offered at every
--- level is listed once, and the proxy picks the level from maki's request.
 local function list_models(ctx)
-  local creds = maki.provider.auth.get(ctx.slug)
-  local data, err = cloudcode("fetchAvailableModels", creds.access, { project = creds.project })
-  if not data then
+  local creds, err = credentials(ctx.slug)
+  if not creds then
     return nil, err
   end
-  local ids, served = {}, {}
+  local data, fetch_err = cloudcode("fetchAvailableModels", creds.access, { project = creds.project })
+  if not data then
+    return nil, fetch_err
+  end
+  local rows, seen = {}, {}
   for _, sort in ipairs(data.agentModelSorts or {}) do
     for _, group in ipairs(sort.groups or {}) do
       for _, id in ipairs(group.modelIds or {}) do
-        table.insert(ids, id)
-        served[id] = true
+        if not seen[id] then
+          seen[id] = true
+          local info = (data.models or {})[id] or {}
+          table.insert(rows, {
+            id = id,
+            context_window = info.maxTokens,
+            max_output_tokens = info.maxOutputTokens,
+            supports_thinking = info.supportsThinking == true,
+            supports_vision = info.supportsImages == true,
+          })
+        end
       end
-    end
-  end
-  local function listed_as(id)
-    local base = id:match("^(.+)%-%a+$")
-    for _, level in ipairs(LEVELS) do
-      if not base or not served[base .. "-" .. level] then
-        return id
-      end
-    end
-    return base
-  end
-  local rows, listed = {}, {}
-  for _, id in ipairs(ids) do
-    local name = listed_as(id)
-    if not listed[name] then
-      listed[name] = true
-      local info = (data.models or {})[id] or {}
-      table.insert(rows, {
-        id = name,
-        context_window = info.maxTokens,
-        max_output_tokens = info.maxOutputTokens,
-        supports_thinking = info.supportsThinking == true,
-        supports_vision = info.supportsImages == true,
-      })
     end
   end
   return rows

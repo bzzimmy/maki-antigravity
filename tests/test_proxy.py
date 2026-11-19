@@ -12,34 +12,27 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "proxy")
 import antigravity_proxy as proxy  # noqa: E402
 
 PROMPT = {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]}
+USER_AGENT = "antigravity/cli/test"
 STREAM = [
     b'data: {"response": {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]}, "traceId": "t"}\n',
     b"\n",
 ]
 
 
-def thinking(config, max_output=None):
-    generation = {"thinkingConfig": config}
-    if max_output:
-        generation["maxOutputTokens"] = max_output
-    return {"generationConfig": generation}
+class XHighThinkingTest(unittest.TestCase):
+    def test_sets_proto_enum_on_xhigh_models(self):
+        request = {"generationConfig": {"thinkingConfig": {"includeThoughts": True, "thinkingLevel": "high"}}}
+        proxy.apply_xhigh("gemini-4-neon-xhigh", request)
+        self.assertEqual(request["generationConfig"]["thinkingConfig"]["thinkingLevel"], 100)
 
+    def test_leaves_other_models_and_off_thinking_alone(self):
+        high_req = {"generationConfig": {"thinkingConfig": {"includeThoughts": True, "thinkingLevel": "high"}}}
+        proxy.apply_xhigh("gemini-4-neon-high", high_req)
+        self.assertEqual(high_req["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high")
 
-class UpstreamModelTest(unittest.TestCase):
-    def test_level_comes_from_the_request(self):
-        cases = [
-            ("gemini-3.8-flash", thinking({"thinkingLevel": "high"}), "gemini-3.8-flash-high"),
-            ("gemini-3.8-flash", thinking({"includeThoughts": True}), "gemini-3.8-flash-medium"),
-            ("gemini-3.8-flash", {}, "gemini-3.8-flash-low"),
-            ("claude-opus-5-5", thinking({"thinkingBudget": 1638}, 16384), "claude-opus-5-5-low"),
-            ("claude-opus-5-5", thinking({"thinkingBudget": 3276}, 16384), "claude-opus-5-5-medium"),
-            ("claude-opus-5-5", thinking({"thinkingBudget": 8192}, 16384), "claude-opus-5-5-high"),
-            ("claude-opus-5-5", thinking({"thinkingBudget": 13107}, 128000), "claude-opus-5-5-medium"),
-            ("claude-opus-5-5", thinking({"thinkingBudget": 19660}, 128000), "claude-opus-5-5-high"),
-            ("gpt-oss-120b-medium", thinking({"thinkingBudget": 1024}, 32768), "gpt-oss-120b-medium"),
-        ]
-        for model, request, expected in cases:
-            self.assertEqual(proxy.upstream_model(model, request), expected, (model, request))
+        off_req = {"generationConfig": {}}
+        proxy.apply_xhigh("gemini-4-neon-xhigh", off_req)
+        self.assertNotIn("thinkingConfig", off_req["generationConfig"])
 
 
 class CallIdTest(unittest.TestCase):
@@ -76,7 +69,7 @@ class FakeAntigravity(http.server.BaseHTTPRequestHandler):
 
 
 class ProxyTest(unittest.TestCase):
-    def post(self, status, model="gemini-3.8-flash"):
+    def post(self, status, model="gemini-pro-orchestrator", payload=PROMPT):
         upstream = http.server.HTTPServer(("127.0.0.1", 0), FakeAntigravity)
         upstream.status = status
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
@@ -86,8 +79,8 @@ class ProxyTest(unittest.TestCase):
             self.addCleanup(s.shutdown)
         request = urllib.request.Request(
             "http://127.0.0.1:%d/models/%s:streamGenerateContent?alt=sse" % (server.server_address[1], model),
-            json.dumps(PROMPT).encode(),
-            {"authorization": "Bearer tok", proxy.PROJECT_HEADER: "proj"},
+            json.dumps(payload).encode(),
+            {"authorization": "Bearer tok", proxy.PROJECT_HEADER: "proj", "user-agent": USER_AGENT},
         )
         with mock.patch.object(proxy, "API_URL", "http://127.0.0.1:%d/stream" % upstream.server_address[1]):
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -96,9 +89,9 @@ class ProxyTest(unittest.TestCase):
     def test_wraps_the_request_and_unwraps_the_stream(self):
         (headers, envelope), body = self.post(200)
         self.assertEqual(headers["authorization"], "Bearer tok")
-        self.assertEqual(headers["user-agent"], proxy.USER_AGENT)
+        self.assertEqual(headers["user-agent"], USER_AGENT)
         self.assertEqual(envelope["project"], "proj")
-        self.assertEqual(envelope["model"], "gemini-3.8-flash-low")
+        self.assertEqual(envelope["model"], "gemini-pro-orchestrator")
         self.assertEqual(envelope["request"], PROMPT)
         first, rest = body.split(b"\n", 1)
         self.assertEqual(json.loads(first[5:]), {"candidates": [{"content": {"parts": [{"text": "hi"}]}}]})
